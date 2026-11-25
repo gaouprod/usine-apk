@@ -1,0 +1,139 @@
+# Usine à APK : construit les APK Android des apps listées dans apps.json, à
+# partir de leurs dépôts (privés compris), dans ce dépôt public où les minutes
+# GitHub Actions sont gratuites et illimitées.
+#
+# Secret : APP_REPO_TOKEN (jeton fine-grained, « Contents : Read-only » sur les
+# dépôts des apps). Il ne sert qu'à lire le code ; il n'est jamais affiché.
+# Publication : Release `<release>` de ce dépôt, fichier `<apkName>-b<build>.apk`.
+# Signature : clé de debug du gabarit React Native (identique à chaque build :
+# chaque version s'installe par-dessus la précédente). Pas pour les stores.
+name: Usine à APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "App à construire (id dans apps.json, vide = toutes)"
+        required: false
+        default: "40fit"
+      force:
+        description: "Construire même si le code n'a pas changé"
+        type: boolean
+        default: true
+  # Surveillance : toutes les 15 minutes, construit les apps dont le code a changé.
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: write
+
+# Une seule passe à la fois : la suivante lit l'état écrit par la précédente.
+concurrency:
+  group: usine
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          APP: ${{ inputs.app }}
+          FORCE: ${{ inputs.force }}
+        run: node scripts/plan.mjs >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]' && needs.plan.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        app: ${{ fromJson(needs.plan.outputs.matrix) }}
+    name: ${{ matrix.app.name }} b${{ matrix.app.build }}
+    env:
+      BUILD_NUMBER: ${{ matrix.app.build }}
+      APP_DIR: app/${{ matrix.app.dir }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: usine
+      - name: Code de l'app (${{ matrix.app.repo }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.app.repo }}
+          ref: ${{ matrix.app.sha }}
+          token: ${{ secrets.APP_REPO_TOKEN }}
+          path: app
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+      - name: Variables de l'app
+        env:
+          APP_ENV: ${{ toJson(matrix.app.env) }}
+        run: node -e 'for (const [k, v] of Object.entries(JSON.parse(process.env.APP_ENV || "{}"))) if (/^[A-Z][A-Z0-9_]*$/.test(k)) console.log(`${k}=${v}`)' >> "$GITHUB_ENV"
+      - name: Dépendances
+        if: matrix.app.type == 'expo'
+        working-directory: ${{ env.APP_DIR }}
+        run: npm ci
+      - name: Projet Android (prebuild)
+        if: matrix.app.type == 'expo'
+        working-directory: ${{ env.APP_DIR }}
+        run: npx expo prebuild --platform android --no-install --clean
+      - name: Compilation (release, arm64-v8a)
+        working-directory: ${{ env.APP_DIR }}/${{ matrix.app.type == 'expo' && 'android' || '.' }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon
+      - name: Publication dans la Release « ${{ matrix.app.release }} »
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ matrix.app.sha }}
+          REPO: ${{ matrix.app.repo }}
+          NAME: ${{ matrix.app.name }}
+          RELEASE: ${{ matrix.app.release }}
+          APK: ${{ matrix.app.apkName }}-b${{ matrix.app.build }}.apk
+        working-directory: usine
+        run: |
+          SRC=$(find "../$APP_DIR" -path '*/build/outputs/apk/release/*.apk' | head -n 1)
+          test -n "$SRC" || { echo "Aucun APK produit."; exit 1; }
+          cp "$SRC" "$APK"
+          ls -la "$APK"
+          gh release delete "$RELEASE" --yes --cleanup-tag || true
+          gh release create "$RELEASE" "$APK" \
+            --target main \
+            --title "$NAME — APK Android (build $BUILD_NUMBER)" \
+            --notes "Build $BUILD_NUMBER, construit depuis $REPO@${SHA::7}. Installation : toucher le fichier .apk depuis le téléphone ; une nouvelle version s'installe par-dessus la précédente."
+      - name: État de l'usine (dernière construction)
+        env:
+          ID: ${{ matrix.app.id }}
+          SHA: ${{ matrix.app.sha }}
+        working-directory: usine
+        run: |
+          node -e 'require("fs").writeFileSync(`state/${process.env.ID}.json`, JSON.stringify({ sha: process.env.SHA, build: Number(process.env.BUILD_NUMBER), builtAt: new Date().toISOString() }, null, 2) + "\n")'
+          git config user.name "usine-apk"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state
+          git commit -m "État : ${ID} b${BUILD_NUMBER} (${SHA::7})"
+          for i in 1 2 3; do git pull --rebase origin main && git push origin HEAD:main && break; sleep 5; done

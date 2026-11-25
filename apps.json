@@ -1,0 +1,17 @@
+{
+  "apps": [
+    {
+      "id": "40fit",
+      "name": "40fit",
+      "repo": "gaouprod/40fit-app",
+      "ref": "main",
+      "dir": "mobile",
+      "type": "expo",
+      "watch": ["mobile/", "shared/"],
+      "apkName": "40fit",
+      "release": "40fit-android",
+      "firstBuild": 100,
+      "env": { "SIDELOAD": "1" }
+    }
+  ]
+}
